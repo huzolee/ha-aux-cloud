@@ -537,6 +537,13 @@ class AuxCloudAPI:
             vals,
         )
 
+        _LOGGER.warning(
+            "AUX DEBUG productId=%s extern=%s is_v3=%s",
+            device.get("productId"),
+            device.get("extern"),
+            AuxProducts.is_v3_heat_pump(device),
+        )
+
         cookie = json.loads(base64.b64decode(device["cookie"].encode()))
         mapped_cookie = base64.b64encode(
             json.dumps(
