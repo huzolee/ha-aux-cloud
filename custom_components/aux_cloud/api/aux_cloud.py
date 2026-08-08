@@ -346,9 +346,7 @@ class AuxCloudAPI:
                         self.get_device_params(
                             dev,
                             params=(
-                                ["ver"]
-                                if AuxProducts.is_v3_heat_pump(dev)
-                                else AuxProducts.get_params_list(dev["productId"])
+                                ["ver"] if AuxProducts.is_v3_heat_pump(dev) else []
                             ),
                         )
                     )
