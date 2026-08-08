@@ -338,44 +338,47 @@ class AuxCloudAPI:
                 )
 
                 is_heat_pump = dev.get("productId") in AuxProducts.DeviceType.HEAT_PUMP
+                is_v3_heat_pump = AuxProducts.is_v3_heat_pump(dev)
 
-                # Keep original behavior for other devices.
-                # For heat pumps, use ["ver"] because newer models need snapshot mode.
-                if is_heat_pump:
+                # V2 heat pumps do not support DNA.KeyValueControl GET.
+                # Their state is received through the devpush WebSocket.
+                if is_heat_pump and not is_v3_heat_pump:
+                    dev_params_task = None
+                    dev_special_params_task = None
+
+                # Keep the existing V3 heat-pump behavior.
+                elif is_heat_pump:
                     dev_params_task = asyncio.create_task(
-                        self.get_device_params(
-                            dev,
-                            params=(
-                                ["ver"] if AuxProducts.is_v3_heat_pump(dev) else []
-                            ),
-                        )
+                        self.get_device_params(dev, params=["ver"])
                     )
                     dev_special_params_task = None
+
+                # Keep existing behavior for normal AUX devices.
                 else:
                     dev_params_task = asyncio.create_task(
                         self.get_device_params(dev, params=list([]))
                     )
                     dev_special_params_task = None
 
-                if AuxProducts.get_special_params_list(
-                    dev["productId"]
-                ) is not None and not AuxProducts.is_v3_heat_pump(dev):
-                    dev_special_params_task = asyncio.create_task(
-                        self.get_device_params(
-                            dev,
-                            params=AuxProducts.get_special_params_list(
-                                dev["productId"]
-                            ),
-                        )
+                    special_params = AuxProducts.get_special_params_list(
+                        dev["productId"]
                     )
+                    if special_params is not None:
+                        dev_special_params_task = asyncio.create_task(
+                            self.get_device_params(dev, params=special_params)
+                        )
 
                 param_tasks.append([dev, dev_params_task, dev_special_params_task])
 
             results = await asyncio.gather(
                 *[
                     asyncio.gather(
-                        dev_params_task,
-                        *(dev_special_params_task,) if dev_special_params_task else (),
+                        *(dev_params_task,) if dev_params_task is not None else (),
+                        *(
+                            (dev_special_params_task,)
+                            if dev_special_params_task is not None
+                            else ()
+                        ),
                         return_exceptions=True,
                     )
                     for _, dev_params_task, dev_special_params_task in param_tasks
@@ -383,32 +386,36 @@ class AuxCloudAPI:
                 return_exceptions=True,
             )
 
-            for i, (dev, _, _) in enumerate(param_tasks):
-                dev_params = results[i][0]
-                dev_special_params = results[i][1] if len(results[i]) > 1 else None
+            for i, (dev, dev_params_task, dev_special_params_task) in enumerate(param_tasks):
+                result_index = 0
 
-                if dev_params is None or isinstance(dev_params, BaseException):
-                    _LOGGER.error(
-                        "Error fetching device params for %s: %s",
-                        dev["endpointId"],
-                        dev_params,
-                    )
-                else:
-                    dev["params"] = dev_params or {}
+                if dev_params_task is not None:
+                    dev_params = results[i][result_index]
+                    result_index += 1
 
-                if dev_special_params is not None and isinstance(
-                    dev_special_params, BaseException
-                ):
-                    _LOGGER.error(
-                        "Error fetching special device params for %s: %s",
-                        dev["endpointId"],
-                        dev_special_params,
-                    )
-                elif dev_special_params:
-                    dev["params"].update(dev_special_params)
+                    if isinstance(dev_params, BaseException):
+                        _LOGGER.error(
+                            "Error fetching device params for %s: %s",
+                            dev["endpointId"],
+                            dev_params,
+                        )
+                    else:
+                        dev["params"] = dev_params or {}
+
+                if dev_special_params_task is not None:
+                    dev_special_params = results[i][result_index]
+
+                    if isinstance(dev_special_params, BaseException):
+                        _LOGGER.error(
+                            "Error fetching special device params for %s: %s",
+                            dev["endpointId"],
+                            dev_special_params,
+                        )
+                    elif dev_special_params:
+                        dev["params"].update(dev_special_params)
 
                 # Heat pump tank temperature decoding
-                if AuxProducts.is_v3_heat_pump(dev):
+                if is_v3_heat_pump := AuxProducts.is_v3_heat_pump(dev):
                     key_states = dev["params"].get("key_states")
                     decoded = _decode_v3_hp_tank_temp_from_key_states(key_states)
                     if decoded is not None:
