@@ -1,6 +1,9 @@
 """Aux Cloud integration for Home Assistant."""
 
 import asyncio
+import base64
+import json
+import time
 from datetime import timedelta
 
 import voluptuous as vol
@@ -95,6 +98,11 @@ class AuxCloudCoordinator(DataUpdateCoordinator):
         self.devices = []
         self._device_state_helpers: dict[str, DeviceStateHelper] = {}
 
+        # V2 AUX heat pumps expose their full state through the
+        # devpush WebSocket channel instead of DNA.KeyValueControl GET.
+        self._ws_params: dict[str, dict] = {}
+        self._ws_started = False
+
     def get_device_by_endpoint_id(self, endpoint_id: str):
         """Get a device by its endpoint ID."""
         return next(
@@ -113,6 +121,144 @@ class AuxCloudCoordinator(DataUpdateCoordinator):
             helper = DeviceStateHelper(initial_params, MAX_FAILED_POLLS)
             self._device_state_helpers[endpoint_id] = helper
         return helper
+
+    def _apply_websocket_params(self, endpoint_id: str, params: dict) -> None:
+        """Merge parameters received from devpush into coordinator state."""
+        if not endpoint_id or not isinstance(params, dict):
+            return
+
+        cache = self._ws_params.setdefault(endpoint_id, {})
+        cache.update(params)
+
+        updated = False
+
+        for device in self.devices:
+            if device.get("endpointId") != endpoint_id:
+                continue
+
+            device.setdefault("params", {}).update(params)
+            device["last_updated"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime()
+            )
+            updated = True
+
+        if updated:
+            _LOGGER.debug(
+                "Applied AUX WebSocket update for %s: %s",
+                endpoint_id,
+                params,
+            )
+            self.async_set_updated_data({"devices": self.devices})
+
+    async def _handle_websocket_message(self, message: dict) -> None:
+        """Handle AUX Cloud devpush WebSocket messages."""
+        if message.get("topic") != "devpush":
+            return
+
+        msgtype = message.get("msgtype")
+        data = message.get("data") or {}
+
+        # Initial subscription acknowledgement contains a full device snapshot.
+        if msgtype == "subk":
+            for item in data.get("devList", []):
+                if item.get("status") != 0:
+                    continue
+
+                endpoint_id = item.get("endpointId")
+                params = item.get("data") or {}
+
+                if endpoint_id and isinstance(params, dict):
+                    _LOGGER.info(
+                        "Received AUX V2 WebSocket snapshot for %s",
+                        endpoint_id,
+                    )
+                    self._apply_websocket_params(endpoint_id, params)
+
+            return
+
+        # Subsequent state changes arrive as Base64 encoded JSON.
+        if msgtype == "push":
+            endpoint_id = data.get("endpointId")
+            encoded = data.get("data")
+
+            if not endpoint_id or not encoded:
+                return
+
+            try:
+                decoded = base64.b64decode(encoded).decode("utf-8")
+                params = json.loads(decoded)
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Unable to decode AUX WebSocket push for %s: %s",
+                    endpoint_id,
+                    exc,
+                )
+                return
+
+            # did/pid/ver/datatype are metadata, but keeping them is harmless.
+            _LOGGER.debug(
+                "Received AUX WebSocket push for %s: %s",
+                endpoint_id,
+                params,
+            )
+            self._apply_websocket_params(endpoint_id, params)
+
+    async def async_start_websocket(self) -> None:
+        """Start devpush subscription for AUX V2 heat pumps."""
+        if self._ws_started:
+            return
+
+        await self.api.initialize_websocket()
+        self.api.ws_api.add_websocket_listener(self._handle_websocket_message)
+
+        dev_list = []
+
+        for device in self.devices:
+            if device.get("productId") != "000000000000000000000000c3aa0000":
+                continue
+
+            try:
+                extern = json.loads(device.get("extern", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                extern = {}
+
+            if extern.get("ver") != 2:
+                continue
+
+            endpoint_id = device.get("endpointId")
+            dev_session = device.get("devSession")
+
+            if not endpoint_id or not dev_session:
+                continue
+
+            dev_list.append(
+                {
+                    "devSession": dev_session,
+                    "endpointId": endpoint_id,
+                    "gatewayId": "",
+                    "pid": device.get("productId"),
+                }
+            )
+
+        if not dev_list:
+            _LOGGER.info("No AUX V2 heat pumps found for WebSocket subscription.")
+            return
+
+        await self.api.ws_api.send_data(
+            {
+                "data": {"devList": dev_list},
+                "messageid": str(time.time()),
+                "msgtype": "sub",
+                "topic": "devpush",
+            }
+        )
+
+        self._ws_started = True
+
+        _LOGGER.info(
+            "Subscribed to AUX devpush for %s V2 heat pump(s).",
+            len(dev_list),
+        )
 
     async def _async_update_data(self):
         """Fetch data from AUX Cloud."""
@@ -171,6 +317,16 @@ class AuxCloudCoordinator(DataUpdateCoordinator):
                         all_devices.append(device)
 
             self.devices = all_devices
+
+            # HTTP polling cannot read V2 heat-pump KeyValueControl state.
+            # Preserve the latest state received from devpush.
+            for device in self.devices:
+                endpoint_id = device.get("endpointId")
+                cached_params = self._ws_params.get(endpoint_id)
+
+                if cached_params:
+                    device.setdefault("params", {}).update(cached_params)
+
             _LOGGER.debug("Fetched AUX Cloud data: %s devices", len(self.devices))
 
             current_endpoint_ids = {
@@ -217,6 +373,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Perform an initial update
     await coordinator.async_config_entry_first_refresh()
 
+    # V2 AUX heat pumps publish their usable state through devpush.
+    try:
+        await coordinator.async_start_websocket()
+    except Exception as exc:
+        _LOGGER.error("Unable to start AUX Cloud WebSocket: %s", exc)
+
     # Store the coordinator for platform use
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "coordinator": coordinator,
@@ -230,7 +392,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload the config entry and platforms."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    api = entry_data.get("api")
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
     if unload_ok:
-        hass.data.pop(DOMAIN)
+        if api and api.ws_api:
+            await api.ws_api.close_websocket()
+
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+
+        if not hass.data.get(DOMAIN):
+            hass.data.pop(DOMAIN, None)
+
     return unload_ok
